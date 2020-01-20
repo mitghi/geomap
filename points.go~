@@ -1,0 +1,220 @@
+package geomap
+
+import (
+	"fmt"
+	"math"
+	"sort"
+
+	"github.com/mitghi/geomap/storage"
+)
+
+// - MARK: Alloc/Init section.
+
+func NewGeoMap(resolution float64) *GeoMap {
+	var (
+		mkfn storage.StoreBuilder = func() storage.StoreInterface {
+			return storage.NewStore()
+		}
+	)
+	return &GeoMap{
+		tiles:    newGrid(resolution, mkfn),
+		position: make(map[string]PointInterface),
+		ld:       DegreeDistance{},
+	}
+}
+
+// - MARK: GeoMap section.
+
+func (gm *GeoMap) Add(p PointInterface) {
+	var (
+		tile storage.StoreInterface
+	)
+	gm.Remove(p.Id())
+	tile = gm.tiles.AddEntry(p)
+	tile.Add(p.Id(), p)
+	gm.position[p.Id()] = p
+}
+
+func (gm *GeoMap) Add(points ...PointInterface) {
+	var (
+		tile storage.StoreInterface
+	)
+	for _, p := range points {
+		gm.Remove(p.Id())
+		tile = gm.tiles.AddEntry(p)
+		tile.Add(p.Id(), p)
+		gm.position[p.Id()] = p
+	}
+}
+
+func (gm *GeoMap) Get(id string) (p PointInterface) {
+	var (
+		ok  bool
+		r   interface{}
+		rok bool
+	)
+	if p, ok = gm.position[id]; ok {
+		r, rok = gm.tiles.GetEntry(p).Get(p.Id())
+		if rok {
+			p = r.(PointInterface)
+			return p
+		}
+	}
+
+	return nil
+}
+
+func (gm *GeoMap) Remove(id string) {
+	if v, ok := gm.position[id]; ok {
+		var s storage.StoreInterface = gm.tiles.GetEntry(v)
+		s.Delete(v.Id())
+		delete(gm.position, v.Id())
+	}
+}
+
+func (gm *GeoMap) All() (all map[string]PointInterface) {
+	all = make(map[string]PointInterface, 0)
+	for k, v := range gm.position {
+		all[k] = v
+	}
+	return all
+}
+
+func (gm *GeoMap) Range(tl PointInterface, br PointInterface) []PointInterface {
+	var (
+		stores = gm.tiles.Range(tl, br)
+		fn     AcceptFn
+	)
+	fn = func(p PointInterface) bool {
+		return isBetween(p.Lat(), br.Lat(), tl.Lat()) && isBetween(p.Lon(), tl.Lon(), br.Lon())
+	}
+	return getPoints(stores, fn)
+}
+
+func (gm *GeoMap) Nearest(point PointInterface, k int, maxDistance float64, accept AcceptFn) (nbp []PointInterface) {
+	var (
+		pstore       storage.StoreInterface
+		tcnt         int
+		cindex       cell
+		coarseMaxDis float64
+	)
+	nbp = make([]PointInterface, 0)
+	pstore = gm.tiles.GetEntry(point)
+	nbp = append(nbp, getPoints([]storage.StoreInterface{pstore}, accept)...)
+	cindex = CalcCell(point, gm.tiles.resolution)
+	coarseMaxDis = math.Max(float64(maxDistance)*2.0, float64(gm.tiles.resolution)*2.0+0.01)
+	for d := 1; float64(d)*float64(gm.tiles.resolution) <= coarseMaxDis; d++ {
+		var oldcnt int = len(nbp)
+		nbp = seekPoints(nbp, gm.tiles.get(cindex.x-d, cindex.x+d, cindex.y+d, cindex.y+d), accept)
+		nbp = seekPoints(nbp, gm.tiles.get(cindex.x-d, cindex.x+d, cindex.y-d, cindex.y-d), accept)
+		nbp = seekPoints(nbp, gm.tiles.get(cindex.x-d, cindex.x-d, cindex.y-d+1, cindex.y+d-1), accept)
+		nbp = seekPoints(nbp, gm.tiles.get(cindex.x+d, cindex.x+d, cindex.y-d+1, cindex.y+d-1), accept)
+		tcnt += len(nbp) - oldcnt
+		if tcnt > k {
+			break
+		}
+	}
+	psorted := &sortedPoints{nbp, point, gm.ld}
+	sort.Sort(psorted)
+	k = min(k, len(psorted.points))
+	for i, nearby := range psorted.points {
+		if Distance(point, nearby) > maxDistance || i == k {
+			k = i
+			break
+		}
+	}
+
+	return psorted.points[0:k]
+}
+
+func (gm *GeoMap) Within(point PointInterface, distance float64, accept AcceptFn) (nbp []PointInterface) {
+	var (
+		d      int
+		cindex cell
+		pw     []PointInterface
+	)
+	nbp = make([]PointInterface, 0)
+	pw = make([]PointInterface, 0)
+	d = int(distance / gm.tiles.resolution)
+	if d == 0 {
+		d = 1
+	}
+	cindex = CalcCell(point, gm.tiles.resolution)
+	nbp = seekPoints(nbp, gm.tiles.get(cindex.x-d, cindex.x+d, cindex.y-d, cindex.y+d), accept)
+	for _, nearby := range nbp {
+		if Distance(point, nearby) < distance {
+			pw = append(pw, nearby)
+		}
+	}
+
+	return pw
+}
+
+// - MARK: Point section.
+
+func NewPoint(id string, lat float64, lon float64) *Point {
+	return &Point{id, lat, lon}
+}
+
+func (p *Point) Id() string {
+	return p.PId
+}
+
+func (p *Point) Lat() float64 {
+	return p.PLat
+}
+
+func (p *Point) Lon() float64 {
+	return p.PLon
+}
+
+func (p *Point) Meta() interface{} {
+	// TODO
+	return nil
+}
+
+func (p *Point) String() string {
+	return fmt.Sprintf("%s %f %f", p.Id(), p.Lat(), p.Lon())
+}
+
+func (p *sortedPoints) approxSquareDistance(p1, p2 PointInterface) float64 {
+	avgLat := (p1.Lat() + p2.Lat()) / 2.0
+
+	latLen := math.Abs(p1.Lat()-p2.Lat()) * float64(latDegreeLength)
+	lonLen := math.Abs(p1.Lon()-p2.Lon()) * float64(p.ld.get(avgLat))
+
+	return latLen*latLen + lonLen*lonLen
+}
+
+func (p *sortedPoints) Len() int {
+	return len(p.points)
+}
+
+func (p *sortedPoints) Swap(i, j int) {
+	p.points[i], p.points[j] = p.points[j], p.points[i]
+}
+
+func (p *sortedPoints) Less(i, j int) bool {
+	return p.approxSquareDistance(p.points[i], p.point) < p.approxSquareDistance(p.points[j], p.point)
+}
+
+// - MARK: Functions section.
+
+func getPoints(stores []storage.StoreInterface, accept AcceptFn) []PointInterface {
+	var (
+		result []PointInterface = make([]PointInterface, 0)
+	)
+	return seekPoints(result, stores, accept)
+}
+
+func seekPoints(points []PointInterface, stores []storage.StoreInterface, accept AcceptFn) []PointInterface {
+	for _, s := range stores {
+		for _, v := range s.Values() {
+			var p PointInterface = v.(PointInterface)
+			if accept(p) {
+				points = append(points, p)
+			}
+		}
+	}
+	return points
+}
